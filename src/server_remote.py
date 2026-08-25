@@ -3,15 +3,18 @@ Remote MCP Server for Bandcamp (HTTP/SSE transport)
 For deployment to Render, Railway, Fly.io, etc.
 """
 import os
+import time
+import secrets
 import logging
 from typing import Any, Sequence
+from urllib.parse import quote
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 import uvicorn
 
 from .bandcamp_client import BandcampClient
@@ -392,11 +395,96 @@ async def health(request):
     return JSONResponse({"status": "ok", "service": "bandcamp-mcp"})
 
 
+# ---------------------------------------------------------------------------
+# Rubber-stamp OAuth server.
+#
+# claude.ai (and other MCP clients) refuse to connect to a remote server unless
+# it advertises an OAuth authorization server. This server exposes only public
+# Bandcamp data, so there is nothing to protect: the endpoints below implement
+# the OAuth discovery/registration/authorize/token dance and simply say "yes".
+# ---------------------------------------------------------------------------
+
+def _base_url(request) -> str:
+    """Public base URL, honoring the reverse proxy (Render/Fly/etc.)."""
+    base = os.environ.get("BASE_URL")
+    if base:
+        return base.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get(
+        "x-forwarded-host", request.headers.get("host", request.url.netloc)
+    )
+    return f"{proto}://{host}"
+
+
+async def oauth_protected_resource(request):
+    """RFC 9728: tell the client which authorization server guards us."""
+    base = _base_url(request)
+    return JSONResponse({"resource": base, "authorization_servers": [base]})
+
+
+async def oauth_authorization_server(request):
+    """RFC 8414: advertise our authorize/token/register endpoints."""
+    base = _base_url(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def register(request):
+    """RFC 7591: accept any dynamic client registration, hand back a client_id."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return JSONResponse({
+        "client_id": f"bandcamp-{secrets.token_hex(8)}",
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": body.get("redirect_uris", []),
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }, status_code=201)
+
+
+async def authorize(request):
+    """Auto-approve: bounce straight back to the client with a fresh code."""
+    params = request.query_params
+    redirect_uri = params.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={secrets.token_urlsafe(24)}"
+    state = params.get("state")
+    if state:
+        location += f"&state={quote(state)}"
+    return RedirectResponse(location, status_code=302)
+
+
+async def token(request):
+    """Issue a bearer token for any code — we don't actually check it."""
+    return JSONResponse({
+        "access_token": secrets.token_urlsafe(32),
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "",
+    })
+
+
 # Starlette app with routes
 starlette_app = Starlette(
     debug=False,
     routes=[
         Route("/health", health),
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+        Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+        Route("/register", register, methods=["POST"]),
+        Route("/authorize", authorize),
+        Route("/token", token, methods=["POST"]),
         Route("/sse", handle_sse),
         Route("/messages/", handle_messages, methods=["POST"]),
     ],

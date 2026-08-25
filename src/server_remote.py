@@ -7,7 +7,7 @@ import time
 import secrets
 import logging
 from typing import Any, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
@@ -453,10 +453,28 @@ async def register(request):
     }, status_code=201)
 
 
+def _is_allowed_redirect(uri: str) -> bool:
+    """Guard against open redirects: only real MCP-client callbacks are allowed."""
+    try:
+        parts = urlsplit(uri)
+    except Exception:
+        return False
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https" and (host == "claude.ai" or host.endswith(".claude.ai")):
+        return True
+    # Loopback callbacks used by desktop / CLI MCP clients (e.g. Claude Desktop).
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 async def authorize(request):
     """Auto-approve: bounce straight back to the client with a fresh code."""
     params = request.query_params
     redirect_uri = params.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
+    if not _is_allowed_redirect(redirect_uri):
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri not allowed"},
+            status_code=400,
+        )
     sep = "&" if "?" in redirect_uri else "?"
     location = f"{redirect_uri}{sep}code={secrets.token_urlsafe(24)}"
     state = params.get("state")

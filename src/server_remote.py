@@ -6,14 +6,15 @@ import os
 import time
 import secrets
 import logging
+import contextlib
 from typing import Any, Sequence
 from urllib.parse import quote, urlsplit
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
-from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse, RedirectResponse
 import uvicorn
 
@@ -371,23 +372,20 @@ async def call_tool(
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-# SSE transport for MCP
-sse = SseServerTransport("/messages/")
+# Streamable HTTP transport for MCP (the transport claude.ai's remote
+# connectors speak; the older HTTP+SSE transport is deprecated).
+# Stateless: each request is self-contained, which survives Render's free-tier
+# instance restarts/idling without stale-session errors.
+session_manager = StreamableHTTPSessionManager(
+    app=app,
+    json_response=False,
+    stateless=True,
+)
 
 
-async def handle_sse(request):
-    """Handle SSE connection for MCP."""
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await app.run(
-            streams[0], streams[1], app.create_initialization_options()
-        )
-
-
-async def handle_messages(request):
-    """Handle POST messages for MCP."""
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+async def handle_mcp(scope, receive, send):
+    """ASGI entrypoint that hands the request to the MCP session manager."""
+    await session_manager.handle_request(scope, receive, send)
 
 
 async def health(request):
@@ -493,9 +491,19 @@ async def token(request):
     })
 
 
-# Starlette app with routes
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    """Run the MCP session manager for the lifetime of the ASGI app."""
+    async with session_manager.run():
+        yield
+
+
+# Starlette app with routes. The explicit routes are matched first; the root
+# Mount catches everything else (POST/GET/DELETE) and serves the MCP endpoint,
+# so claude.ai can connect to the bare server URL.
 starlette_app = Starlette(
     debug=False,
+    lifespan=lifespan,
     routes=[
         Route("/health", health),
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
@@ -503,8 +511,7 @@ starlette_app = Starlette(
         Route("/register", register, methods=["POST"]),
         Route("/authorize", authorize),
         Route("/token", token, methods=["POST"]),
-        Route("/sse", handle_sse),
-        Route("/messages/", handle_messages, methods=["POST"]),
+        Mount("/", app=handle_mcp),
     ],
 )
 
